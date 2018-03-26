@@ -1,0 +1,170 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+=begin
+  A mildly complex VagrantFile example for a single VM with most 
+  of the important definitions defined at the very top of the file for
+  easier modification.
+
+  This VagrantFile is geared towards a local Ansible playbook deployment.
+  As such, don't install ansible in your predesployment script (Vagrant
+  will handle that part with the correct version it requires).
+
+  Provider target is virtualbox but this should be easy to repurpose 
+  for multiple providers.
+=end
+
+Vagrant.require_version ">= 1.8.0"
+
+# A name for your project, this will be the vm name
+PROJECT = "nginx-box"
+
+VAGRANTFILE_API_VERSION = "2"
+
+# AUTOMEMORY set to true will have the vagrant instance use 1/4 your total memory available
+AUTOMEMORY = true
+
+# If AUTOMEMORY is false or we cannot determine the local host memory then 
+# the vagrant instance will use this instead.
+MEMORY = 1024
+
+# Ports passed through to your workstation, sourc to destination.
+PORTS = {
+  8080=>8080,
+  9090=>9090
+}
+
+# Setup docker provisioning. After this runs it will also look for docker-compose.yml
+# in the same folder and try to up it.
+DOCKER = false
+
+# use vagrant-vbguest addon to update/install virtualbox extensions
+#  - enabling this can slow down the vagrant up process quite a bit 
+VBOXEXTENSIONS = false
+
+# Run once at the start of provisioning
+RUNONCE_AT_START = <<SCRIPT
+  # For some EC2 instances this will prevent invalid locale warnings
+  sudo touch /var/lib/cloud/instance/locale-check.skip
+  sudo sysctl -p --system
+  
+  # perform updates
+  sudo apt-get update
+  sudo apt-get upgrade -y
+  
+  # Install some other packages if you like.
+  # sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common git python-pip
+  # sudo pip install boto3 netaddr botocore cursor cx_Oracle PyYAML aws-shell
+SCRIPT
+
+RUNALWAYS_AT_START = <<SCRIPT
+  # NA
+SCRIPT
+
+RUNONCE_AT_END = <<SCRIPT
+  # Clean any extra stuff we don't need at the end
+  sudo apt-get autoremove
+SCRIPT
+
+RUNALWAYS_AT_END = <<SCRIPT
+  # NA
+SCRIPT
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = "ubuntu/xenial64"
+  config.vm.box_url = "https://app.vagrantup.com/ubuntu/boxes/xenial64"
+  config.vm.hostname = PROJECT
+  config.vm.box_check_update = true
+
+  # Plugin vagrant-cachier (caching downloaded packages)
+  if Vagrant.has_plugin?("vagrant-cachier")
+    config.cache.enable :apt
+    config.cache.enable :apt_lists
+    config.cache.enable :composer
+  end
+
+  # Plugin: vagrant-vbguest - Manage virtualbox guest extension upgrade/install
+  #   Install: vagrant plugin install vagrant-vbguest
+  if VBOXEXTENSIONS && Vagrant.has_plugin?("vagrant-vbguest")
+    # Automatically update the guest extensions
+    config.vbguest.auto_update = true
+    # do NOT download the iso file from a webserver
+    config.vbguest.no_remote = true
+  elsif Vagrant.has_plugin?("vagrant-vbguest")
+    # Automatically update the guest extensions
+    config.vbguest.auto_update = false
+    # do NOT download the iso file from a webserver
+    config.vbguest.no_remote = true
+  end
+
+  # Networking
+  # Share each port in PORTS from the VM to the guest (under the same port).
+
+  PORTS.each do |guest_port, host_port|
+    config.vm.network "forwarded_port", guest: guest_port, host: host_port
+  end
+
+  config.ssh.forward_agent = true
+  config.ssh.shell = "bash -c 'BASH_ENV=/etc/profile exec bash'"  
+
+   # VM Provider specific settings for VirtualBox
+  config.vm.provider "virtualbox" do |vb|
+    # Share VPN connections
+    #vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    vb.name = "#{PROJECT}"
+    vb.cpus = 2
+    vb.customize [ "modifyvm", :id, "--uartmode1", "disconnected" ]
+
+    if AUTOMEMORY
+      # Used later for automemory assignment
+      host = RbConfig::CONFIG['host_os']
+
+      # Give VM 1/4 system memory 
+      if host =~ /darwin/
+        # sysctl returns Bytes and we need to convert to MB
+        mem = `sysctl -n hw.memsize`.to_i / 1024
+      elsif host =~ /linux/
+        # meminfo shows KB and we need to convert to MB
+        mem = `grep 'MemTotal' /proc/meminfo | sed -e 's/MemTotal://' -e 's/ kB//'`.to_i 
+      elsif host =~ /mswin|mingw|cygwin/
+        # Windows code via https://github.com/rdsubhas/vagrant-faster
+        mem = `wmic computersystem Get TotalPhysicalMemory`.split[1].to_i / 1024
+      end
+      mem = mem / 1024 / 4
+    else
+      mem = MEMORY
+    end
+  
+    vb.memory = "#{mem}"
+  end
+
+  # Provision: once at start
+  config.vm.provision "shell", inline: RUNONCE_AT_START
+
+  # Provision: each time at start
+  config.vm.provision "shell", run: "always", inline: RUNALWAYS_AT_START
+
+  if DOCKER
+    config.vm.provision :docker
+    config.vm.provision :docker_compose, yml: "/vagrant/docker-compose.yml", run: "always"
+  end
+
+  # Run any other provisioning you want to perform here. 
+  # This example does some ansible locally.
+  config.vm.provision "ansible", run: "always", type: :ansible_local do |ansible|
+    # Do not provide an inventory path as vagrant will create it
+    #ansible.inventory_path = "provisioning/inventory"
+    ansible.galaxy_role_file = "ansible-role-requirements.yml"
+    ansible.galaxy_roles_path = "/vagrant/provisioning/roles"
+    ansible.galaxy_command = "ansible-galaxy install --role-file=%{role_file} --roles-path=%{roles_path}"
+
+    # Note that any roles in your playbook will need to be fully qualified
+    ansible.playbook = "provisioning/playbook.yml"
+  end
+
+  # Provision: once at end
+  config.vm.provision "shell", inline: RUNONCE_AT_END
+
+  # Provision: each time at end
+  config.vm.provision "shell", run: "always", inline: RUNALWAYS_AT_END
+end
